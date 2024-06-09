@@ -1,0 +1,638 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+First, loading packages:
+
+```{r, warning = FALSE, message = FALSE}
+library(dplyr)
+library(lubridate)
+library(astsa)
+library(LSTS)
+library(leaps)
+library(glmnet)
+```
+
+Taking the initial raw data, which has one large .csv file per year, and paring each down to just MDW-departing flights:
+
+```{r}
+for (yr in 2009:2018) {
+  file_name <- paste0(yr, ".csv")
+  full_year_df <- read.csv(file_name)
+  
+  mdw_year_df <- full_year_df %>% 
+    dplyr::filter(ORIGIN == "MDW")
+  
+  out_name <- paste0("mdw", yr, ".csv")
+  write.csv(mdw_year_df, out_name)
+}
+```
+
+Taking the MDW-specific csvs and combining them. Evaluating what percent of each year's flights out of MDW were on Southwest, then paring the data down just to Southwest data:
+
+```{r}
+mdw_all <- read.csv("mdw2009.csv")
+for (yr in 2010:2018) {
+  file_name <- paste0("mdw", yr, ".csv")
+  mdw_year_df <- read.csv(file_name)
+  
+  mdw_all <- mdw_all %>% 
+    dplyr::bind_rows(mdw_year_df)
+}
+
+mdw_carrier_by_year <- mdw_all %>% 
+  dplyr::group_by(year = lubridate::year(FL_DATE)) %>% 
+  dplyr::summarise(pct_wn = mean(OP_CARRIER == "WN"))
+
+mdw_wn <- mdw_all %>% 
+  dplyr::filter(OP_CARRIER == "WN")
+
+write.csv(mdw_wn, "mdw_wn.csv")
+```
+
+Making a plot to visualize the percentage of flights out of MDW operated by Southwest:
+
+```{r}
+barplot(100 * mdw_carrier_by_year$pct_wn ~ mdw_carrier_by_year$year, 
+        xlab = "Year", ylab = "Percent Southwest", ylim = c(0, 100),
+        main = "Percent of flights out of MDW operated by Southwest")
+abline(h = 100, lwd = 5)
+```
+
+Building the actual time series: for each day, what percent of Southwest flights out of MDW were either delayed over 15 minutes or cancelled?
+
+```{r}
+mdw_wn <- read.csv("mdw_wn.csv")
+mdw_ts <- mdw_wn %>% 
+  dplyr::group_by(date = lubridate::ymd(FL_DATE)) %>% 
+  dplyr::summarise(pct_delayed = mean(DEP_DELAY >= 15 | CANCELLED == 1))
+```
+
+Some missing data (a couple months' worth); the problem is avoided by starting the time series at August 2011:
+
+```{r}
+table(year(mdw_ts$date), month(mdw_ts$date))
+
+mdw_ts <- mdw_ts %>% 
+  dplyr::filter(date >= lubridate::ymd("2011-08-01"))
+```
+
+Splitting the data into a pre-2018 "training" set and a validation set consisting of data from 2018:
+
+```{r}
+mdw_ts_all <- mdw_ts
+
+mdw_ts <- mdw_ts %>% 
+  dplyr::filter(date < lubridate::ymd("2018-01-01"))
+```
+
+Plotting the original time series and a subset for a closer look:
+
+```{r}
+plot(100 * mdw_ts$pct_delayed ~ mdw_ts$date, type = "l", 
+     main = "Original time series of MDW WN flight delay data", 
+     xlab = "Date", 
+     ylab = "Percent of flights delayed")
+
+mdw_ts_subset <- mdw_ts %>% 
+  dplyr::filter(between(date, lubridate::ymd("2011-12-01"), lubridate::ymd("2013-01-21")))
+
+plot(100 * mdw_ts_subset$pct_delayed ~ mdw_ts_subset$date, type = "l", 
+     main = "Subset of time series of flight delay data", 
+     xlab = "Date", 
+     ylab = "Percent of flights delayed")
+```
+
+Looking at ACF. Lots of large autocorrelations! 
+
+```{r}
+acf(mdw_ts$pct_delayed, lag.max = 200, type = "correlation", plot = TRUE, 
+    main = "Correlogram of original, pre-2018 data")
+```
+
+Out of curiosity/as a starting point, trying differencing. Don't see much of a linear trend, but just to see: 
+
+```{r}
+pct_delayed_diff <- diff(mdw_ts$pct_delayed)
+mdw_ts$pct_delayed_diff <- c(NA, pct_delayed_diff)
+plot(100 * mdw_ts$pct_delayed_diff ~ mdw_ts$date, type = "l", 
+     main = "Differenced time series of flight delay data", 
+     xlab = "Date", 
+     ylab = "Percent of flights delayed")
+
+acf(mdw_ts$pct_delayed_diff[-1], lag.max = 200, type = "correlation", plot = TRUE, 
+    main = "Correlogram of differenced pre-2018 data")
+```
+
+From the above, a bit of a stunningly white-noise-reminiscent ACF. A couple larger autocorrelations at small lags. Is there a global linear trend? Removing the mean difference doesn't result in data that looks any more stationary:
+
+```{r}
+diff_trend <- mean(mdw_ts$pct_delayed_diff, na.rm = TRUE)
+
+plot(100 * mdw_ts$pct_delayed - (diff_trend * (0:(nrow(mdw_ts) - 1))) ~ mdw_ts$date, type = "l", 
+     main = "Time series with mean difference removed", 
+     xlab = "Date", 
+     ylab = "Percent of flights delayed")
+```
+
+Maybe there's a lot of local linearity, but that doesn't really help much with data interpretability. Out of curiosity, differencing a second time:
+
+```{r}
+pct_delayed_diff2 <- diff(mdw_ts$pct_delayed_diff[-1])
+mdw_ts$pct_delayed_diff2 <- c(NA, NA, pct_delayed_diff2)
+plot(100 * mdw_ts$pct_delayed_diff2 ~ mdw_ts$date, type = "l", 
+     main = "Differenced time series of flight delay data", 
+     xlab = "Date", 
+     ylab = "Percent of flights delayed")
+
+acf(mdw_ts$pct_delayed_diff2[-c(1:2)], lag.max = 200, type = "correlation", plot = TRUE, 
+    main = "Correlogram of twice-differenced data")
+
+mean(mdw_ts$pct_delayed_diff2, na.rm = TRUE)
+```
+
+Another nice ACF, but a mean difference near 0. Maybe there's an ARIMA model there with differencing one and having a small MA component (given the single-differencing ACF). Trying out a few different models:
+
+```{r}
+arima1 <- arima(mdw_ts$pct_delayed, order = c(0, 1, 1), method = "CSS-ML")
+arima2 <- arima(mdw_ts$pct_delayed, order = c(0, 1, 2), method = "CSS-ML")
+arima3 <- arima(mdw_ts$pct_delayed, order = c(0, 1, 3), method = "CSS-ML")
+arima4 <- arima(mdw_ts$pct_delayed, order = c(0, 1, 4), method = "CSS-ML")
+arima5 <- arima(mdw_ts$pct_delayed, order = c(0, 2, 1), method = "CSS-ML")
+arima6 <- arima(mdw_ts$pct_delayed, order = c(0, 2, 2), method = "CSS-ML")
+
+AIC(arima1, arima2, arima3, arima4, arima5, arima6)
+arima3$coef
+```
+
+Single differencing with an MA(3) component has the lowest AIC. For fun, trying a couple more with an AR component:
+
+```{r}
+arima7 <- arima(mdw_ts$pct_delayed, order = c(1, 1, 0), method = "CSS-ML")
+arima8 <- arima(mdw_ts$pct_delayed, order = c(1, 1, 3), method = "CSS-ML")
+
+AIC(arima3, arima7, arima8)
+```
+
+Lowest AIC is still the ARIMA(0, 1, 3). 
+
+Checking out the empirical PACF:
+
+```{r}
+pacf(mdw_ts$pct_delayed, main = "PACF of original, pre-2018 data")
+```
+
+Really nice structure: non-zero PACFs up to lag 7, so a week's worth of past data. Looking at an AR(7) model:
+
+```{r}
+arima12 <- arima(mdw_ts$pct_delayed, order = c(7, 0, 0), method = "CSS-ML")
+AIC(arima3, arima12)
+arima12$coef
+arima12$sigma2
+```
+
+A lower AIC than the ARIMA(0, 1, 3) model. I'll continue to look at those two models below:
+
+```{r}
+diff_ma.fit <- arima3
+ar.fit <- arima12 
+```
+
+Looking at diagnostics:
+
+```{r}
+par(mfrow = c(3, 2))
+tsdiag(diff_ma.fit, gof.lag = 20)
+tsdiag(ar.fit, gof.lag = 20)
+```
+
+Alongside the lower AIC, the AR model has nice (and better) diagnostics: in particular, unlike the diff/MA model, it has non-significant p-values for the Ljung-Box statistic across lags. 
+
+Using cross-validation now on the data from 2017, fitting and evaluating ARIMA(0, 1, 3) and AR(7) models for all previous data for each day in that year (as well as for 2018, for coding simplicity):
+
+```{r}
+# Initializing empty objects to hold forecasts
+n_days_to_forecast <- 365 * 2
+forecasts_diff_ma <- matrix(NA, nrow = n_days_to_forecast, ncol = 1)
+forecasts_ar <- matrix(NA, nrow = n_days_to_forecast, ncol = 1)
+actual <- matrix(NA, nrow = n_days_to_forecast, ncol = 1)
+```
+
+```{r}
+end_baseline_date <- lubridate::ymd("2016-12-31")
+
+# For each day...
+for (i in 0:(n_days_to_forecast - 1)) {
+  
+  # Subset data to include only prior days
+  data_to_consider <- mdw_ts_all %>% 
+    dplyr::filter(date <= end_baseline_date + i)
+  
+  # Train each of the two models on that data
+  diff_ma_tmp <- arima(data_to_consider$pct_delayed, order = c(0, 1, 3), method = "CSS-ML")
+  ar_tmp <- arima(data_to_consider$pct_delayed, order = c(7, 0, 0), method = "CSS-ML")
+  
+  # Generate forecasts for that day via each of the two models
+  forecasts_diff_ma[i + 1, ] <- predict(diff_ma_tmp, n.ahead = 1)$pred
+  forecasts_ar[i + 1, ] <- predict(ar_tmp, n.ahead = 1)$pred
+  
+  # Record actual value for that data
+  actual[i + 1, ] <- mdw_ts_all$pct_delayed[which(mdw_ts_all$date == end_baseline_date + i)]
+  print(i)
+}
+```
+
+Separating/extracting the 2017 (from the training data) forecasts and actual data from the 2018 data:
+
+```{r}
+length(forecasts_ar)
+diff_ma_2017 <- forecasts_diff_ma[1:365]
+ar_2017 <- forecasts_ar[1:365]
+actual_2017 <- actual[1:365]
+
+forecasts_diff_ma <- forecasts_diff_ma[366:(365 * 2)]
+forecasts_ar <- forecasts_ar[366:(365 * 2)]
+actual <- actual[366:(365 * 2)]
+```
+
+Evaluating CV scores:
+
+```{r}
+CVis <- rep(NA, 2)
+CVis[1] <- mean((diff_ma_2017 - actual_2017) ^ 2)
+CVis[2] <- mean((ar_2017 - actual_2017) ^ 2)
+round(CVis, 3)
+```
+
+Essentially equivalent. Given the diagnostics on the AR model -- and a feeling that it's a bit more interpretable -- I'll move forward with that.
+
+Of course, an AR-only model like that doesn't make for very interesting long-term forecasting. But with the model in hand, we can certainly forecast one day at a time based on past/existing data. That's done for the 2018 ("validation") data below. Note that this involves using true 2018 data to predict future 2018 data, not predicted 2018 data to predict future 2018 data. My thought is that in reality, if we were predicting a day forward, we would use the model on all existing/previous "real" data -- as done here -- not previously-predicted data.
+
+```{r}
+# Extracting 2018 data
+data_2018 <- mdw_ts_all %>% 
+  dplyr::filter(date >= lubridate::ymd("2018-01-01"))
+
+# For each day in the full data...
+for (i in 7:(nrow(mdw_ts_all) - 1)) {
+  date_to_forecast <- lubridate::ymd("2011-08-01") + i
+  
+  # Predict it using the fitted global AR(7) model
+  index_last_date <- which(mdw_ts_all$date == date_to_forecast - 1)
+  last_7 <- mdw_ts_all$pct_delayed[(index_last_date:(index_last_date - 6))]
+  last_7 <- last_7 - ar.fit$coef["intercept"]
+  res <- ar.fit$coef[1:7] %*% last_7 + ar.fit$coef["intercept"]
+  mdw_ts_all[i + 1, "predicted_value"] <- res
+}
+AR_forecasts <- mdw_ts_all$predicted_value[which(mdw_ts_all$date >= lubridate::ymd("2018-01-01"))]
+```
+
+Plotting those forecasts vs. the actual data:
+
+```{r}
+par(mfrow = c(1, 1))
+plot(100 * data_2018$pct_delayed ~ data_2018$date, col = rgb(0, 0, 0, .3),
+     type = "l", lwd = 1.5, 
+     main = "Actual vs. forecasted delays from 'final' AR model, 2018 validation data", 
+     xlab = "Date (month)", 
+     ylab = "Percent delayed")
+points(100 * AR_forecasts ~ data_2018$date, col = "blue", type = "l", lwd = 1.5)
+legend("topright", legend = c("Actual", "Predicted"),
+       col = c(rgb(0, 0, 0, .3), "blue"), lty = 1, lwd = 2, cex = 1)
+```
+
+Visually, pretty good! Although it doesn't quite capture the extremes of some of the more volatile moments. Could a frequency-domain-based approach capture more of that volatility? In general, from the initial time plot, it looks like there are big spikes in delays in the winter and summer and much fewer delay-heavy days in the spring and fall. Note that in the original data ACF, there's a drop in ACF around 90-100 days (a quarter of a year) and a relative re-increase around 180 days (half a year).
+
+Starting by comparing the theoretical spectral density of the fitted AR(7) model and comparing it to the empirical spectral density of the data:
+
+```{r}
+theo_spec <- astsa::arma.spec(ar = ar.fit$coef[-8], var.noise = ar.fit$sigma2, 
+                 main = "Theoretical spectral density, AR fit", plot = FALSE)
+
+# Change plot margins to allow for visible secondary y-axis
+par(mar = c(5, 4, 4, 3.5))
+
+# Plot empirical spectral density
+emp_spec <- stats::spectrum(mdw_ts$pct_delayed, type = "h", ylim = c(1e-02, 3), 
+                        main = "Spectral densities of the pre-2018 data", 
+                        log = "no", 
+                        lwd = 2, 
+                        xlab = "Frequency", 
+                        ylab = "Empirical spectral density")
+
+# Plot theoretical spectral density on same plot on secondary y axis
+par(new = TRUE)
+plot(as.vector(theo_spec$spec) ~ theo_spec$freq, 
+     type = "l", lwd = 4, col = "pink", 
+     xlab = NA, ylab = NA, axes = FALSE)
+
+# Label secondary y axis
+axis(side = 4, at = seq(0, .5, by = .1))
+mtext("Theoretical spectral density", side = 4, line = 2)
+
+# Add legend to plot
+legend("topright", legend = c("Empirical", "Theoretical"),
+       col = c("black", "pink"), lty = 1, lwd = 2, cex = 1)
+```
+
+Not terribly far off. There's a bit of a spike at a frequency of around .14, or a period of about 7 days, which makes sense. There's also another big spike at a much lower frequency. Where is that?
+
+```{r}
+print(1 / emp_spec$freq[which.max(emp_spec$spec[-1]) + 1])
+```
+
+A relatively dominant frequency corresponding to aperiod of roughly 185 days -- just about half a year. That lines up with the visual inspection described above. 
+
+Although it's not included below, I tried fitting a periodic model with sines and cosines only with periods of 7 and 182 (an even number, rounding from 365 / 2), and that wasn't flexible enough. Going to the other extreme and fitting a model with all periods between 1 and 182, just to start:
+
+```{r}
+t <- 1:nrow(mdw_ts)
+d <- 364
+
+# Build a data frame: a column of responses, and then a column for 
+# each possible component sine/cosine 
+seasonal_components <- data.frame("pct_delayed" = mdw_ts$pct_delayed)
+
+for (f in 1:(d/2)) {
+  col_cos_name <- paste0("v", f, "cos")
+  col_sin_name <- paste0("v", f, "sin")
+  seasonal_components <- seasonal_components %>% 
+    dplyr::mutate(!!col_cos_name := cos(2 * pi * f * t / d)) %>% 
+    dplyr::mutate(!!col_sin_name := sin(2 * pi * f * t / d))
+}
+
+# Fit linear model
+lm_all_freqs = lm(pct_delayed ~ ., data = seasonal_components)
+```
+
+Inspecting the fit:
+
+```{r}
+par(mar = c(5, 4, 4, 2))
+plot(100 * mdw_ts$pct_delayed ~ mdw_ts$date, col = rgb(0, 0, 0, .3),
+     type = "l", lwd = 1.5, 
+     main = "All-frequencies periodic model, actual delays vs. fitted", 
+     xlab = "Date", 
+     ylab = "Percent delayed")
+points(100 * lm_all_freqs$fitted.values ~ mdw_ts$date, type = "l", col = "blue", lwd = 2)
+legend("topright", legend = c("Actual", "Fitted"),
+       col = c(rgb(0, 0, 0, .3), "blue"), lty = 1, lwd = 2, cex = 1)
+```
+
+Very busy, and it still doesn't get the extremes (and this is looking at the fit to the training data). To try to make it less busy, I'll run stepwise selection on the sine/cosine terms -- forward selection, so that we start with 0 rather than all 364:
+
+```{r}
+lm_forward_selection <- leaps::regsubsets(pct_delayed ~ ., data = seasonal_components, 
+                          nvmax = ncol(seasonal_components) - 1, 
+                          really.big = TRUE, 
+                          method = "forward")
+lm_forward_selection_summary <- summary(lm_forward_selection)
+best_seasonal_model <- order(lm_forward_selection_summary$cp, decreasing = TRUE)[1]
+
+# How many sines/cosines are in the final model
+sum(lm_forward_selection_summary$which[best_seasonal_model, ]) - 1
+```
+
+Turns out that the model chosen by forward selection keeps every sine/cosine. Does the LASSO cut down on that number at all?
+
+```{r}
+# Find the best lambda/regularization parameter
+lasso_seasonal_cv <- glmnet::cv.glmnet(y = as.matrix(seasonal_components$pct_delayed), 
+                                       x = as.matrix(seasonal_components[, -1]),
+                                       alpha = 1, 
+                                       intercept = TRUE)
+
+# Fit the model with that best lambda
+best_lasso_seasonal_model <- glmnet::glmnet(y = as.matrix(seasonal_components$pct_delayed), 
+                                       x = as.matrix(seasonal_components[, -1]),
+                                       alpha = 1, 
+                                       intercept = TRUE, 
+                                       lambda = lasso_seasonal_cv$lambda.min)
+
+# How many kept?
+sum(coef(best_lasso_seasonal_model) != 0) - 1 # -1 for intercept
+```
+
+Yes, quite a bit -- it keeps 61 of the 364, with ones corresponding to half-year and weekly periods among those with the largest magnitudes.
+
+```{r}
+lasso_seasonal_coefs <- as.vector(coef(best_lasso_seasonal_model))
+names(lasso_seasonal_coefs) <- rownames(coef(best_lasso_seasonal_model))
+top5 <- names(sort(abs(lasso_seasonal_coefs[-1]), decreasing = TRUE)[1:5])
+lasso_seasonal_coefs[top5]
+```
+
+Inspecting the fit:
+
+```{r}
+lasso_predictions <- predict(lasso_seasonal_cv, 
+                 as.matrix(seasonal_components[, -1]), 
+                 s = "lambda.min")
+
+plot(100 * mdw_ts$pct_delayed ~ mdw_ts$date, col = rgb(0, 0, 0, .3),
+     type = "l", lwd = 1.5, 
+     main = "Periodic lasso model, actual delays vs. fitted", 
+     xlab = "Date", 
+     ylab = "Percent delayed")
+points(100 * lasso_predictions ~ mdw_ts$date, type = "l", col = "blue", lwd = 2)
+legend("topright", legend = c("Actual", "Fitted"),
+       col = c(rgb(0, 0, 0, .3), "blue"), lty = 1, lwd = 2, cex = 1)
+```
+
+Less busy, but again, no real success in capturing the high-volatility periods. 
+
+How do the full and LASSO periodic models compare in predicting the 2018 data vs. the daily AR model?
+
+```{r}
+t_validation_data <- 1:nrow(mdw_ts_all)
+d <- 364
+
+# First, establishing predictor data frame for 2018 data for periodic models
+seasonal_components_validation <- data.frame("pct_delayed" = mdw_ts_all$pct_delayed)
+for (f in 1:(d/2)) {
+  col_cos_name <- paste0("v", f, "cos")
+  col_sin_name <- paste0("v", f, "sin")
+  seasonal_components_validation <- seasonal_components_validation %>% 
+    dplyr::mutate(!!col_cos_name := cos(2* pi * f * t_validation_data / d)) %>% 
+    dplyr::mutate(!!col_sin_name := sin(2 * pi * f * t_validation_data / d))
+}
+seasonal_components_validation <- seasonal_components_validation %>% 
+  dplyr::filter(row_number() > nrow(!!seasonal_components))
+
+# Function to plot 2018 predictions compared to actual 2018 data; 
+# returns MSE of predictions
+plot_validation_data <- function(predictions, title) {
+  plot(100 * data_2018$pct_delayed ~ data_2018$date, col = rgb(0, 0, 0, .3),
+     type = "l", lwd = 1.5, ylim = c(0, 100),
+     main = title, 
+     xlab = "Date (month)", 
+     ylab = "Percent delayed")
+  
+  points(100 * predictions ~ data_2018$date, col = "blue", type = "l", lwd = 1.5)
+  
+  return (mean((predictions - data_2018$pct_delayed) ^ 2))
+}
+
+par(mfrow = c(3, 1))
+
+# For AR model, all-frequency periodic model, and LASSO periodic model, 
+# plot predictions vs. actual and evaluate corresponding MSEs
+
+predictions1 <- AR_forecasts
+title1 <- "AR model (daily predictions), 2018 validation data" 
+MSE1 <- plot_validation_data(predictions1, title1)
+
+predictions2 <- predict(lm_all_freqs, seasonal_components_validation)
+title2 <- "All-frequencies periodic model, 2018 validation data" 
+MSE2 <- plot_validation_data(predictions2, title2)
+
+predictions3 <- predict(lasso_seasonal_cv, 
+                        as.matrix(seasonal_components_validation[, -1]),  
+                        s = "lambda.min")
+title3 <- "Seasonal lasso model, 2018 validation data" 
+MSE3 <- plot_validation_data(predictions3, title3)
+
+print(c(MSE1, MSE2, MSE3))
+```
+
+The lowest MSE is for the AR model, which looks to be the winner. That's not entirely unexpected, since in some sense, it may not be apples-to-apples -- 2018 data is used to inform 2018 predictions in the AR model -- but still, in all cases, the 2018 data are being evaluated against models that have been defined using only pre-2018 data.
+
+A couple other things to look at. First, is it possible to combine the AR and multi-seasonal perspectives (from what I know, SARIMA works best with just one seasonal component) -- say, by fitting some sort of seasonal frequency-domain-based model to the residuals of the AR model?
+
+```{r}
+par(mfrow = c(1, 1))
+
+residuals_to_consider <- mdw_ts_all %>% 
+  dplyr::filter(between(date, lubridate::ymd("2011-08-08"), lubridate::ymd("2017-12-31"))) %>% 
+  dplyr::mutate(residual = predicted_value - pct_delayed)
+
+plot(residuals_to_consider$residual ~ residuals_to_consider$date, 
+     col = rgb(0, 0, 0, 1),
+     type = "l", lwd = 1.5, 
+     main = "Residuals from AR model, pre-2018 data", 
+     xlab = "Date", 
+     ylab = "Residual")
+```
+
+Just in plotting those residuals, it doesn't look like there's much seasonal structure. My sense is there's not going to be much gained by going down that path, so I'll hold off for now. 
+
+Second, what if the data were smoothed? Could that reduce some of the big peaks/volatile periods in the data and make a seasonal/frequency-domain-based model a better fit? Looking at smoothing over a period of a week ($q = 3$):
+
+```{r}
+par(mfrow = c(1, 1))
+q <- 3
+smoothing_parameter <- 2 * q + 1
+smoothed_trend <- stats::filter(mdw_ts$pct_delayed, 
+                               rep(1, smoothing_parameter) / smoothing_parameter)
+
+# Plot smoothed trend estimate
+plot(smoothed_trend[-c(1:q)] ~ mdw_ts$date[-c(1:q)], type = "l", col = "black", 
+     main = "Time series of flight delay data", 
+     xlab = "Date", ylab = "Percent of flights delayed", 
+     ylim = c(0, 1))
+```
+
+There are still data points with big spikes, but they're less frequent now. What does the spectral density look like?
+
+```{r}
+emp_spec <- stats::spectrum(na.omit(smoothed_trend), type = "h",
+                        main = "Empirical spectral density, smoothed data", 
+                        log = "no", 
+                        lwd = 2)
+```
+
+Mostly longer periods, as expected; nothing clearly dominant. Below, I'll use the LASSO again to help pick out the right frequencies to keep. Briefly looking at the residuals and their correlogram: 
+
+```{r}
+smoothing_residuals <- mdw_ts$pct_delayed - smoothed_trend
+plot(smoothing_residuals[-c(1:3)] ~ mdw_ts$date[-c(1:3)], type = "l", col = "black", 
+     main = "Time plot of residuals, smoothed data", 
+     xlab = "Month", ylab = "Percent of flights delayed")
+
+acf(smoothing_residuals, lag.max = 50, type = "correlation", plot = TRUE, 
+    main = "Residuals correlogram, smoothed trend estimate", na.action = na.pass)
+```
+
+Fitting a periodic model with the LASSO, similarly to how it was done for the original data above: 
+
+```{r}
+t <- 1:length(na.omit(smoothed_trend))
+d <- 364
+
+# Build a data frame: a column of responses, and then a column for 
+# each possible component sine/cosine 
+smoothed_data_seasonal_components <- data.frame("smoothed_data" = na.omit(smoothed_trend))
+
+for (f in 1:(d/2)) {
+  col_cos_name <- paste0("v", f, "cos")
+  col_sin_name <- paste0("v", f, "sin")
+  smoothed_data_seasonal_components <- smoothed_data_seasonal_components %>% 
+    dplyr::mutate(!!col_cos_name := cos(2 * pi * f * t / d)) %>% 
+    dplyr::mutate(!!col_sin_name := sin(2 * pi * f * t / d))
+}
+
+# Find best regularization parameter
+lasso_cv_smoothed <- glmnet::cv.glmnet(y = as.matrix(smoothed_data_seasonal_components$smoothed_data), 
+                              x = as.matrix(smoothed_data_seasonal_components[, -1]),
+                              alpha = 1, 
+                              intercept = TRUE)
+
+# Predict on pre-2018 data
+lasso_predictions_smoothed <- predict(lasso_cv_smoothed, 
+                                      as.matrix(smoothed_data_seasonal_components[, -1]), 
+                                      s = "lambda.min")
+```
+
+Comparing its predictions on the 2018 data to the "actual" smoothed 2018 data...
+
+```{r}
+# Predict on 2018 data
+smoothed_data_2018_forecasts <- predict(lasso_cv_smoothed, 
+                                        as.matrix(seasonal_components_validation[, -1]),  
+                                        s = "lambda.min")
+
+smoothed_trend_all <- stats::filter(mdw_ts_all$pct_delayed, 
+                                    rep(1, smoothing_parameter) / smoothing_parameter)
+
+smoothed_trend_2018 <- smoothed_trend_all[(length(smoothed_trend_all) - 364):(length(smoothed_trend_all) - q)]
+```
+
+...and plotting that alongside the three earlier models:
+
+```{r}
+par(mfrow = c(4, 1))
+
+predictions1 <- AR_forecasts
+title1 <- "AR model (daily predictions), 2018 validation data" 
+MSE1 <- plot_validation_data(predictions1, title1)
+
+predictions2 <- predict(lm_all_freqs, seasonal_components_validation)
+title2 <- "All-frequencies periodic model, 2018 validation data" 
+MSE2 <- plot_validation_data(predictions2, title2)
+
+predictions3 <- predict(lasso_seasonal_cv, 
+                        as.matrix(seasonal_components_validation[, -1]),  
+                        s = "lambda.min")
+title3 <- "Seasonal lasso model, 2018 validation data" 
+MSE3 <- plot_validation_data(predictions3, title3)
+
+plot(smoothed_trend_2018 ~ data_2018$date[1:(365 - q)], col = rgb(0, 0, 0, .3),
+     type = "l", lwd = 1.5, ylim = c(0, 1),
+     main = "Seasonal lasso model, 2018 validation data, smoothed (weekly)", 
+     xlab = "Date", ylab = "Percent of flights delayed")
+
+points(smoothed_data_2018_forecasts[1:(365 - q)] ~ data_2018$date[1:(365 - q)], 
+       type = "l", col = "blue", lwd = 2)
+```
+
+The smoothed 2018 data doesn't quite bounce around so much, and neither do the predictions. The MSE is lower than for the other models...
+
+```{r}
+mean((smoothed_data_2018_forecasts[1:(365 - q)] - smoothed_trend_2018) ^ 2)
+print(c(MSE1, MSE2, MSE3))
+```
+
+...but it doesn't lend itself well to predictions (smoothed data requires future information), and my feeling is it's not quite as interesting a model from an interpretability standpoint.
+
